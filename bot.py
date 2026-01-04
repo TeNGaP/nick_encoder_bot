@@ -18,6 +18,118 @@ MINI_CTF_THREAD_ID = int(os.getenv("MINI_CTF_THREAD_ID", "0"))
 DATA_DIR = Path("./data")
 DATA_DIR.mkdir(exist_ok=True)
 QUEUE_FILE = DATA_DIR / "queue.json"
+SCORES_FILE = DATA_DIR / "scores.json"
+
+
+# Roles and Scores
+def load_scores() -> dict:
+    if not SCORES_FILE.exists():
+        return {}
+    return json.loads(SCORES_FILE.read_text(encoding="utf-8"))
+
+def save_scores(scores: dict) -> None:
+    SCORES_FILE.write_text(
+        json.dumps(scores, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+
+async def solve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Ответь /solve на сообщение с решением.")
+        return
+
+    member = await context.bot.get_chat_member(
+        update.effective_chat.id,
+        update.effective_user.id
+    )
+    if member.status not in ("administrator", "creator"):
+        await update.message.reply_text("⛔ Только админы могут подтверждать решения.")
+        return
+
+    user = update.message.reply_to_message.from_user
+    user_id = str(user.id)
+    username = user.username or user.first_name
+
+    scores = load_scores()
+
+    if user_id not in scores:
+        scores[user_id] = {
+            "name": username,
+            "solves": 0,
+            "role": "Solver"
+        }
+
+    scores[user_id]["solves"] += 1
+    save_scores(scores)
+
+    await update.message.reply_text(
+        f"🧩 *{username}* решил Mini-CTF!\n"
+        f"Всего решений: {scores[user_id]['solves']}",
+        parse_mode="Markdown"
+    )
+
+# Profile 
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scores = load_scores()
+
+    # Если команда отправлена reply — покажем профиль того пользователя
+    target_user = None
+    if update.message.reply_to_message:
+        target_user = update.message.reply_to_message.from_user
+    else:
+        target_user = update.effective_user
+
+    user_id = str(target_user.id)
+    username = target_user.username or target_user.first_name
+
+    if user_id not in scores:
+        await update.message.reply_text(
+            f"👤 *{username}*\n"
+            f"Роль: 🆕 Новичок\n"
+            f"Решений: 0\n\n"
+            f"💡 Решай Mini-CTF, чтобы получить роль 🧩 Solver!",
+            parse_mode="Markdown"
+        )
+        return
+
+    solves = scores[user_id].get("solves", 0)
+    role = scores[user_id].get("role", "Solver")
+
+    # Маппинг ролей на эмодзи/названия
+    role_map = {
+        "Solver": "🧩 Solver",
+        "Winner": "🏆 Winner",
+    }
+    role_text = role_map.get(role, role)
+
+    await update.message.reply_text(
+        f"👤 *{username}*\n"
+        f"Роль: {role_text}\n"
+        f"Решений: *{solves}*",
+        parse_mode="Markdown"
+    )
+
+#Leaderboard
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scores = load_scores()
+
+    if not scores:
+        await update.message.reply_text("📭 Пока никто не решил ни одного Mini-CTF.")
+        return
+
+    sorted_users = sorted(
+        scores.values(),
+        key=lambda x: x["solves"],
+        reverse=True
+    )
+
+    text = "🏆 *Leaderboard*\n\n"
+    for i, user in enumerate(sorted_users[:10], start=1):
+        text += f"{i}. 🧩 {user['name']} — {user['solves']} решений\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 # Время ежедневного поста (Лос-Анджелес)
 DAILY_POST_TIME = time(hour=9, minute=0)  # 09:00
@@ -188,6 +300,9 @@ def main():
     app = Application.builder().token(token).build()
 
     # handlers
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("solve", solve))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("methods", methods))
     app.add_handler(CommandHandler("chatid", chatid))

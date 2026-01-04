@@ -9,7 +9,7 @@ from datetime import time
 from typing import Tuple, Optional
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 MINI_CTF_THREAD_ID = int(os.getenv("MINI_CTF_THREAD_ID", "0"))
 
@@ -19,6 +19,20 @@ DATA_DIR = Path("./data")
 DATA_DIR.mkdir(exist_ok=True)
 QUEUE_FILE = DATA_DIR / "queue.json"
 SCORES_FILE = DATA_DIR / "scores.json"
+CURRENT_FILE = DATA_DIR / "current_challenge.json"
+
+
+# Challenge
+def load_current() -> dict:
+    if not CURRENT_FILE.exists():
+        return {}
+    try:
+        return json.loads(CURRENT_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_current(data: dict) -> None:
+    CURRENT_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # Roles and Scores
@@ -53,12 +67,15 @@ async def solve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     scores = load_scores()
 
+
     if user_id not in scores:
         scores[user_id] = {
             "name": username,
             "solves": 0,
             "role": "Solver"
         }
+
+    scores[user_id]["name"] = username
 
     scores[user_id]["solves"] += 1
     save_scores(scores)
@@ -137,6 +154,63 @@ DAILY_POST_TIME = time(hour=9, minute=0)  # 09:00
 METHODS = ["caesar", "rot13", "base64", "hex", "url", "xor", "reverse"]
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
+#Checker
+def normalize(s: str) -> str:
+    return s.strip()
+
+async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+
+    # Проверяем что это именно нужная ветка Mini-CTF
+    if msg.message_thread_id != MINI_CTF_THREAD_ID:
+        return
+
+    current = load_current()
+    if not current:
+        return
+
+    # (опционально) требуем ответом (reply) на пост бота
+    # если хочешь без reply — просто закомментируй этот блок
+    if not msg.reply_to_message or msg.reply_to_message.message_id != current.get("message_id"):
+        return
+
+    user = update.effective_user
+    user_id = str(user.id)
+    username = user.username or user.first_name
+
+    # не засчитываем повторно одному и тому же
+    solved_by = current.get("solved_by", [])
+    if user_id in solved_by:
+        return
+
+    user_answer = normalize(msg.text)
+    correct = normalize(current.get("answer", ""))
+
+    if user_answer != correct:
+        return
+
+    # ✅ Засчитываем решение (без админ-команды)
+    scores = load_scores()
+
+    if user_id not in scores:
+        scores[user_id] = {"name": username, "solves": 0, "role": "Solver"}
+
+    scores[user_id]["name"] = username
+    scores[user_id]["solves"] += 1
+    save_scores(scores)
+
+    solved_by.append(user_id)
+    current["solved_by"] = solved_by
+    save_current(current)
+
+    await msg.reply_text(
+        f"✅ *Верно!* 🧩\n"
+        f"*{username}* решил Mini-CTF!\n"
+        f"Всего решений: *{scores[user_id]['solves']}*",
+        parse_mode="Markdown"
+    )
 
 # ---------- Хранилище очереди ----------
 def load_queue() -> list[str]:
@@ -273,7 +347,22 @@ async def post_challenge(app: Application, chat_id: int):
     save_queue(queue)
 
     msg = build_challenge_message(payload)
-    await app.bot.send_message(chat_id=chat_id, message_thread_id=MINI_CTF_THREAD_ID, text=msg, parse_mode="Markdown")
+    sent = await app.bot.send_message(
+    chat_id=chat_id,
+    message_thread_id=MINI_CTF_THREAD_ID,
+    text=msg,
+    parse_mode="Markdown"
+)
+
+# сохраняем активное задание для автопроверки
+save_current({
+    "chat_id": chat_id,
+    "thread_id": MINI_CTF_THREAD_ID,
+    "message_id": sent.message_id,  # ← КЛЮЧЕВО
+    "answer": payload,              # правильный ответ
+    "solved_by": []                 # кто уже решил
+})
+
 
 async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Простая защита: разрешаем только админам
@@ -300,6 +389,7 @@ def main():
     app = Application.builder().token(token).build()
 
     # handlers
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("solve", solve))

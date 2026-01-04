@@ -11,6 +11,9 @@ from typing import Tuple, Optional
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+MINI_CTF_THREAD_ID = int(os.getenv("MINI_CTF_THREAD_ID", "0"))
+
+
 # ---------- Настройки ----------
 DATA_DIR = Path("./data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -148,7 +151,7 @@ async def post_challenge(app: Application, chat_id: int):
     queue = load_queue()
     if not queue:
         await app.bot.send_message(
-            chat_id=chat_id,
+            chat_id=chat_id, message_thread_id=MINI_CTF_THREAD_ID,
             text="📭 Сегодня очередь пустая. Добавь ссылки командой: /add <ссылка>",
         )
         return
@@ -158,7 +161,7 @@ async def post_challenge(app: Application, chat_id: int):
     save_queue(queue)
 
     msg = build_challenge_message(payload)
-    await app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+    await app.bot.send_message(chat_id=chat_id, message_thread_id=MINI_CTF_THREAD_ID, text=msg, parse_mode="Markdown")
 
 async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Простая защита: разрешаем только админам

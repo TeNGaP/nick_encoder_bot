@@ -337,7 +337,8 @@ async def post_challenge(app: Application, chat_id: int):
     queue = load_queue()
     if not queue:
         await app.bot.send_message(
-            chat_id=chat_id, message_thread_id=MINI_CTF_THREAD_ID,
+            chat_id=chat_id,
+            message_thread_id=MINI_CTF_THREAD_ID,
             text="📭 Сегодня очередь пустая. Добавь ссылки командой: /add <ссылка>",
         )
         return
@@ -347,21 +348,23 @@ async def post_challenge(app: Application, chat_id: int):
     save_queue(queue)
 
     msg = build_challenge_message(payload)
-    sent = await app.bot.send_message(
-    chat_id=chat_id,
-    message_thread_id=MINI_CTF_THREAD_ID,
-    text=msg,
-    parse_mode="Markdown"
-)
 
-# сохраняем активное задание для автопроверки
-save_current({
-    "chat_id": chat_id,
-    "thread_id": MINI_CTF_THREAD_ID,
-    "message_id": sent.message_id,  # ← КЛЮЧЕВО
-    "answer": payload,              # правильный ответ
-    "solved_by": []                 # кто уже решил
-})
+    sent = await app.bot.send_message(
+        chat_id=chat_id,
+        message_thread_id=MINI_CTF_THREAD_ID,
+        text=msg,
+        parse_mode="Markdown"
+    )
+
+    # 🔐 СОХРАНЯЕМ АКТИВНОЕ ЗАДАНИЕ
+    save_current({
+        "chat_id": chat_id,
+        "thread_id": MINI_CTF_THREAD_ID,
+        "message_id": sent.message_id,  # ← ключевая строка
+        "answer": payload,              # правильный ответ
+        "solved_by": []
+    })
+
 
 
 async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):

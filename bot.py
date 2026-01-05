@@ -10,6 +10,7 @@ from typing import Tuple, Optional
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.constants import ParseMode
 
 MINI_CTF_THREAD_ID = int(os.getenv("MINI_CTF_THREAD_ID", "0"))
 
@@ -29,6 +30,27 @@ RANKS = [
     (20, "👑 Legend"),
 ]
 
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🧠 *Справка по командам бота*\n\n"
+        "📌 *Основное*\n"
+        "• /start — краткое приветствие\n"
+        "• /help — список всех команд и что они делают\n"
+        "• /methods — методы шифрования, которые использует бот\n"
+        "• /chatid — показать chat_id текущего чата (для настройки)\n\n"
+        "🧩 *Mini-CTF*\n"
+        "• /add <ссылка или текст> — добавить задание в очередь (админы/участники, как ты настроишь)\n"
+        "• /queue — показать сколько заданий в очереди\n"
+        "• /postnow — запостить Mini-CTF прямо сейчас (только админ)\n\n"
+        "🏆 *Прогресс*\n"
+        "• /profile — твой профиль (ранг + решённые задания)\n"
+        "  ↳ также можно ответить (reply) на сообщение человека и написать /profile — покажет его профиль\n"
+        "• /leaderboard — топ-10 по количеству решённых Mini-CTF\n\n"
+        "✅ *Как засчитывается решение*\n"
+        "— Пиши ответ *reply* на пост бота в ветке Mini-CTF.\n"
+        "— Если включена автопроверка: бот сам засчитает.\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 # Challenge
 def load_current() -> dict:
@@ -310,13 +332,8 @@ def encode_text(method: str, text: str) -> Tuple[str, str]:
 # ---------- Telegram команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот для ежедневных Mini-CTF.\n\n"
-        "Команды:\n"
-        "• /add <ссылка или текст> — добавить в очередь\n"
-        "• /queue — показать размер очереди\n"
-        "• /methods — методы шифрования\n"
-        "• /chatid — узнать chat_id\n"
-        "• /postnow — запостить задание прямо сейчас (админ)\n"
+        "👋 Привет! Я бот для ежедневных Mini-CTF.\n"
+        "Напиши /help чтобы увидеть все команды и правила."
     )
 
 async def methods(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,6 +432,7 @@ def main():
     app = Application.builder().token(token).build()
 
     # handlers
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("leaderboard", leaderboard))

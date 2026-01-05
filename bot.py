@@ -266,7 +266,7 @@ def hex_encode(text: str) -> str:
     return binascii.hexlify(text.encode("utf-8")).decode("ascii")
 
 def url_encode(text: str) -> str:
-    return urllib.parse.quote(text, safe="")
+    return "".join(f"%{b:02X}" for b in text.encode("utf-8"))
 
 def xor_encode(text: str, key: bytes) -> str:
     data = text.encode("utf-8")
@@ -320,8 +320,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  ↳ также можно ответить (reply) на сообщение человека и написать /profile — покажет его профиль\n"
         "• /leaderboard — топ-10 по количеству решённых Mini-CTF\n\n"
         "✅ *Как засчитывается решение*\n"
-        "— Пиши ответ *reply* на пост бота в ветке Mini-CTF.\n"
-        "— Если включена автопроверка: бот сам засчитает.\n"
+        "✉️ Ответ отправляй боту в личные сообщения:\n"
+        "@nick_encoder_bot\n"
     )
 
 async def methods(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -357,7 +357,8 @@ def build_challenge_message(payload: str) -> str:
         "Расшифруй и получи исходную ссылку/текст 👇\n\n"
         f"`{encoded}`\n\n"
         f"📌 {hint}\n\n"
-        "✅ Ответ можешь написать в чат (ссылкой/текстом)."
+        "✉️ Ответ отправляй боту в личные сообщения:\n"
+        "@nick_encoder_bot\n"
     )
     return msg
 

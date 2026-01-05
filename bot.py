@@ -352,11 +352,23 @@ HELP_TEXT = (
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот для ежедневных Mini-CTF.\n"
-        "Напиши /help чтобы увидеть все команды и правила."
+        "🧠 *Справка по командам бота*\n\n"
+        "📌 *Основное*\n"
+        "• /methods — методы шифрования\n"
+        "• /chatid — показать chat_id (для настройки)\n\n"
+        "🧩 *Mini-CTF*\n"
+        "• /add <текст/ссылка> — добавить задание в очередь\n"
+        "• /queue — сколько заданий в очереди\n"
+        "• /postnow — запостить Mini-CTF прямо сейчас (только админ)\n\n"
+        "🏆 *Прогресс*\n"
+        "• /profile — твой профиль (ранг + решения)\n"
+        "  ↳ можно ответить (reply) на сообщение человека и написать /profile — покажет его профиль\n"
+        "• /leaderboard — топ-10 по решениям\n\n"
+        "✅ *Как засчитывается решение*\n"
+        "Ответ пишем *только в личные сообщения боту*.\n"
+        "В группе ответы можно писать, но бот удалит их (если у него есть право удалять)."
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 async def methods_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Методы: " + ", ".join(METHODS))
@@ -548,7 +560,6 @@ def main():
 
     # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("methods", methods_cmd))
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CommandHandler("add", add_cmd))

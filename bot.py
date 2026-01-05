@@ -21,6 +21,14 @@ QUEUE_FILE = DATA_DIR / "queue.json"
 SCORES_FILE = DATA_DIR / "scores.json"
 CURRENT_FILE = DATA_DIR / "current_challenge.json"
 
+RANKS = [
+    (0,  "🆕 Новичок"),
+    (1,  "🧩 Solver"),
+    (5,  "🔐 Hacker"),
+    (10, "🏆 Elite"),
+    (20, "👑 Legend"),
+]
+
 
 # Challenge
 def load_current() -> dict:
@@ -47,6 +55,15 @@ def save_scores(scores: dict) -> None:
         encoding="utf-8"
     )
 
+def get_rank(solves: int) -> str:
+    rank = RANKS[0][1]
+    for threshold, name in RANKS:
+        if solves >= threshold:
+            rank = name
+        else:
+            break
+    return rank
+
 
 async def solve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
@@ -67,32 +84,43 @@ async def solve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     scores = load_scores()
 
-
+    # если пользователь новый
     if user_id not in scores:
         scores[user_id] = {
-            "name": username,
-            "solves": 0,
-            "role": "Solver"
-        }
+        "name": username,
+        "solves": 0,
+    }
 
-    scores[user_id]["name"] = username
+    old_solves = scores[user_id]["solves"]
+    old_rank = get_rank(old_solves)
 
+    # увеличиваем счётчик
     scores[user_id]["solves"] += 1
+
+    new_solves = scores[user_id]["solves"]
+    new_rank = get_rank(new_solves)
+
     save_scores(scores)
 
     await update.message.reply_text(
-        f"🧩 *{username}* решил Mini-CTF!\n"
-        f"Всего решений: {scores[user_id]['solves']}",
-        parse_mode="Markdown"
+    f"🧩 *{username}* решил Mini-CTF!\n"
+    f"Всего решений: *{new_solves}*",
+    parse_mode="Markdown"
     )
 
-# Profile 
+    # 🎉 Проверяем ап ранга
+    if new_rank != old_rank:
+        await update.message.reply_text(
+            f"🎉 *Новый ранг:* {new_rank}",
+            parse_mode="Markdown"
+        )
 
+
+# Profile
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scores = load_scores()
 
-    # Если команда отправлена reply — покажем профиль того пользователя
-    target_user = None
+    # Если команда отправлена reply — смотрим профиль того пользователя
     if update.message.reply_to_message:
         target_user = update.message.reply_to_message.from_user
     else:
@@ -104,27 +132,20 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in scores:
         await update.message.reply_text(
             f"👤 *{username}*\n"
-            f"Роль: 🆕 Новичок\n"
-            f"Решений: 0\n\n"
-            f"💡 Решай Mini-CTF, чтобы получить роль 🧩 Solver!",
+            f"Ранг: 🆕 Новичок\n"
+            f"Решено: 0\n\n"
+            f"💡 Решай Mini-CTF, чтобы прокачать ранг!",
             parse_mode="Markdown"
         )
         return
 
     solves = scores[user_id].get("solves", 0)
-    role = scores[user_id].get("role", "Solver")
-
-    # Маппинг ролей на эмодзи/названия
-    role_map = {
-        "Solver": "🧩 Solver",
-        "Winner": "🏆 Winner",
-    }
-    role_text = role_map.get(role, role)
+    role = get_rank(solves)
 
     await update.message.reply_text(
         f"👤 *{username}*\n"
-        f"Роль: {role_text}\n"
-        f"Решений: *{solves}*",
+        f"Ранг: {role}\n"
+        f"Решено: *{solves}*",
         parse_mode="Markdown"
     )
 
@@ -144,7 +165,9 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "🏆 *Leaderboard*\n\n"
     for i, user in enumerate(sorted_users[:10], start=1):
-        text += f"{i}. 🧩 {user['name']} — {user['solves']} решений\n"
+        role = user.get("role") or get_rank(user.get("solves", 0))
+        text += f"{i}. {role} *{user['name']}* — {user['solves']} ✅\n"
+
 
     await update.message.reply_text(text, parse_mode="Markdown")
 

@@ -1,27 +1,48 @@
 import os
-import json
 import random
 import base64
 import binascii
 import urllib.parse
-from pathlib import Path
 from datetime import time
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
+
+import psycopg
+from psycopg.rows import dict_row
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
+# =========================
+# ENV / CONFIG
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# В Railway обычно будет DATABASE_URL, если ты так назвал переменную.
+# Если ты подключал Postgres через {{ Postgres.DATABASE_URL }},
+# то создай переменную DATABASE_URL и вставь туда это значение.
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("Postgres_DATABASE_URL")
+
+# Основной чат (группа) куда постим
+TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "0"))
+
+# ID ветки (topic) Mini-CTF / Игры
 MINI_CTF_THREAD_ID = int(os.getenv("MINI_CTF_THREAD_ID", "0"))
 
+# ТЗ (для job queue; Railway / Linux обычно читает TZ)
+# Поставь в Variables: TZ=America/Los_Angeles
+DAILY_POST_TIME = time(hour=9, minute=0)  # 09:00
 
-# ---------- Настройки ----------
-DATA_DIR = Path("./data")
-DATA_DIR.mkdir(exist_ok=True)
-QUEUE_FILE = DATA_DIR / "queue.json"
-SCORES_FILE = DATA_DIR / "scores.json"
-CURRENT_FILE = DATA_DIR / "current_challenge.json"
+METHODS = ["caesar", "rot13", "base64", "hex", "url", "xor", "reverse"]
+ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 
+# Ранги по количеству решений
 RANKS = [
     (0,  "🆕 Новичок"),
     (1,  "🧩 Solver"),
@@ -30,30 +51,59 @@ RANKS = [
     (20, "👑 Legend"),
 ]
 
-# Challenge
-def load_current() -> dict:
-    if not CURRENT_FILE.exists():
-        return {}
-    try:
-        return json.loads(CURRENT_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
 
-def save_current(data: dict) -> None:
-    CURRENT_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+# =========================
+# DB helpers
+# =========================
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("Set DATABASE_URL env var (Railway Postgres)")
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
-
-# Roles and Scores
-def load_scores() -> dict:
-    if not SCORES_FILE.exists():
-        return {}
-    return json.loads(SCORES_FILE.read_text(encoding="utf-8"))
-
-def save_scores(scores: dict) -> None:
-    SCORES_FILE.write_text(
-        json.dumps(scores, ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+def init_db() -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    solves INT NOT NULL DEFAULT 0,
+                    rank TEXT NOT NULL DEFAULT '🆕 Новичок',
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS queue_items (
+                    id SERIAL PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS challenges (
+                    id SERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    thread_id BIGINT NOT NULL,
+                    message_id BIGINT,
+                    method TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    encoded TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    hint TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS challenge_solves (
+                    challenge_id INT REFERENCES challenges(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL,
+                    solved_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (challenge_id, user_id)
+                );
+            """)
+        conn.commit()
 
 def get_rank(solves: int) -> str:
     rank = RANKS[0][1]
@@ -64,187 +114,152 @@ def get_rank(solves: int) -> str:
             break
     return rank
 
+def upsert_user(user_id: int, username: str, first_name: str) -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users (user_id, username, first_name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    updated_at = NOW();
+            """, (user_id, username, first_name))
+        conn.commit()
 
-async def solve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Ответь /solve на сообщение с решением.")
-        return
+def add_solve(user_id: int) -> Tuple[int, str, str]:
+    """
+    +1 solve, пересчитать ранг
+    returns: (new_solves, old_rank, new_rank)
+    """
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT solves, rank FROM users WHERE user_id=%s;", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                # если вдруг нет — создадим с 0 и потом добавим
+                cur.execute("""
+                    INSERT INTO users (user_id, solves, rank)
+                    VALUES (%s, 0, %s)
+                    ON CONFLICT (user_id) DO NOTHING;
+                """, (user_id, get_rank(0)))
+                old_solves = 0
+                old_rank = get_rank(0)
+            else:
+                old_solves = int(row["solves"])
+                old_rank = row["rank"] or get_rank(old_solves)
 
-    member = await context.bot.get_chat_member(
-        update.effective_chat.id,
-        update.effective_user.id
-    )
-    if member.status not in ("administrator", "creator"):
-        await update.message.reply_text("⛔ Только админы могут подтверждать решения.")
-        return
+            new_solves = old_solves + 1
+            new_rank = get_rank(new_solves)
 
-    user = update.message.reply_to_message.from_user
-    user_id = str(user.id)
-    username = user.username or user.first_name
+            cur.execute("""
+                UPDATE users
+                SET solves=%s, rank=%s, updated_at=NOW()
+                WHERE user_id=%s;
+            """, (new_solves, new_rank, user_id))
+        conn.commit()
 
-    scores = load_scores()
+    return new_solves, old_rank, new_rank
 
-    # если пользователь новый
-    if user_id not in scores:
-        scores[user_id] = {
-        "name": username,
-        "solves": 0,
-    }
+def queue_push(payload: str) -> int:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO queue_items (payload) VALUES (%s);", (payload,))
+            cur.execute("SELECT COUNT(*) AS c FROM queue_items;")
+            c = int(cur.fetchone()["c"])
+        conn.commit()
+    return c
 
-    old_solves = scores[user_id]["solves"]
-    old_rank = get_rank(old_solves)
+def queue_count() -> int:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM queue_items;")
+            c = int(cur.fetchone()["c"])
+    return c
 
-    # увеличиваем счётчик
-    scores[user_id]["solves"] += 1
+def queue_pop_fifo() -> Optional[str]:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, payload
+                FROM queue_items
+                ORDER BY id ASC
+                LIMIT 1;
+            """)
+            row = cur.fetchone()
+            if not row:
+                return None
+            item_id = row["id"]
+            payload = row["payload"]
+            cur.execute("DELETE FROM queue_items WHERE id=%s;", (item_id,))
+        conn.commit()
+    return payload
 
-    new_solves = scores[user_id]["solves"]
-    new_rank = get_rank(new_solves)
+def deactivate_old_challenges(chat_id: int, thread_id: int) -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE challenges
+                SET is_active=FALSE
+                WHERE chat_id=%s AND thread_id=%s AND is_active=TRUE;
+            """, (chat_id, thread_id))
+        conn.commit()
 
-    save_scores(scores)
+def create_challenge(chat_id: int, thread_id: int, message_id: int,
+                     method: str, payload: str, encoded: str, answer: str, hint: str) -> int:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO challenges
+                    (chat_id, thread_id, message_id, method, payload, encoded, answer, hint, is_active)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                RETURNING id;
+            """, (chat_id, thread_id, message_id, method, payload, encoded, answer, hint))
+            cid = int(cur.fetchone()["id"])
+        conn.commit()
+    return cid
 
-    await update.message.reply_text(
-    f"🧩 *{username}* решил Mini-CTF!\n"
-    f"Всего решений: *{new_solves}*",
-    parse_mode="Markdown"
-    )
+def get_active_challenge() -> Optional[dict]:
+    if TARGET_CHAT_ID == 0 or MINI_CTF_THREAD_ID == 0:
+        return None
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT *
+                FROM challenges
+                WHERE chat_id=%s AND thread_id=%s AND is_active=TRUE
+                ORDER BY id DESC
+                LIMIT 1;
+            """, (TARGET_CHAT_ID, MINI_CTF_THREAD_ID))
+            row = cur.fetchone()
+    return row
 
-    # 🎉 Проверяем ап ранга
-    if new_rank != old_rank:
-        await update.message.reply_text(
-            f"🎉 *Новый ранг:* {new_rank}",
-            parse_mode="Markdown"
-        )
+def has_solved(challenge_id: int, user_id: int) -> bool:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT 1 FROM challenge_solves
+                WHERE challenge_id=%s AND user_id=%s
+                LIMIT 1;
+            """, (challenge_id, user_id))
+            row = cur.fetchone()
+    return bool(row)
 
-
-# Profile
-async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scores = load_scores()
-
-    # Если команда отправлена reply — смотрим профиль того пользователя
-    if update.message.reply_to_message:
-        target_user = update.message.reply_to_message.from_user
-    else:
-        target_user = update.effective_user
-
-    user_id = str(target_user.id)
-    username = target_user.username or target_user.first_name
-
-    if user_id not in scores:
-        await update.message.reply_text(
-            f"👤 *{username}*\n"
-            f"Ранг: 🆕 Новичок\n"
-            f"Решено: 0\n\n"
-            f"💡 Решай Mini-CTF, чтобы прокачать ранг!",
-            parse_mode="Markdown"
-        )
-        return
-
-    solves = scores[user_id].get("solves", 0)
-    role = get_rank(solves)
-
-    await update.message.reply_text(
-        f"👤 *{username}*\n"
-        f"Ранг: {role}\n"
-        f"Решено: *{solves}*",
-        parse_mode="Markdown"
-    )
-
-#Leaderboard
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scores = load_scores()
-
-    if not scores:
-        await update.message.reply_text("📭 Пока никто не решил ни одного Mini-CTF.")
-        return
-
-    sorted_users = sorted(
-        scores.values(),
-        key=lambda x: x["solves"],
-        reverse=True
-    )
-
-    text = "🏆 *Leaderboard*\n\n"
-    for i, user in enumerate(sorted_users[:10], start=1):
-        role = user.get("role") or get_rank(user.get("solves", 0))
-        text += f"{i}. {role} *{user['name']}* — {user['solves']} ✅\n"
-
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-# Время ежедневного поста (Лос-Анджелес)
-DAILY_POST_TIME = time(hour=9, minute=0)  # 09:00
-
-METHODS = ["caesar", "rot13", "base64", "hex", "url", "xor", "reverse"]
-ALPHABET = "abcdefghijklmnopqrstuvwxyz"
-
-#Checker
-def normalize(s: str) -> str:
-    return s.strip()
-
-async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ✅ Принимаем ТОЛЬКО личные сообщения
-    if update.effective_chat.type != "private":
-        return
-
-    msg = update.message
-    if not msg or not msg.text:
-        return
-
-    current = load_current()
-    if not current:
-        await msg.reply_text("❌ Сейчас нет активного Mini-CTF.")
-        return
-
-    user = update.effective_user
-    user_id = str(user.id)
-    username = user.username or user.first_name
-
-    # Не засчитываем повторно
-    solved_by = current.get("solved_by", [])
-    if user_id in solved_by:
-        await msg.reply_text("ℹ️ Ты уже решил это задание.")
-        return
-
-    user_answer = normalize(msg.text)
-    correct = normalize(current.get("answer", ""))
-
-    if user_answer != correct:
-        await msg.reply_text("❌ Неверно. Попробуй ещё раз 👀")
-        return
-
-    # ✅ Засчитываем решение
-    scores = load_scores()
-    if user_id not in scores:
-        scores[user_id] = {"name": username, "solves": 0, "role": "Solver"}
-
-    scores[user_id]["name"] = username
-    scores[user_id]["solves"] += 1
-    save_scores(scores)
-
-    solved_by.append(user_id)
-    current["solved_by"] = solved_by
-    save_current(current)
-
-    await msg.reply_text(
-        f"🎉 Верно!\n\n"
-        f"🧠 Ты решил Mini-CTF\n"
-        f"🏆 Всего решений: {scores[user_id]['solves']}"
-    )
-
-# ---------- Хранилище очереди ----------
-def load_queue() -> list[str]:
-    if not QUEUE_FILE.exists():
-        return []
-    try:
-        return json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-def save_queue(queue: list[str]) -> None:
-    QUEUE_FILE.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
+def mark_solved(challenge_id: int, user_id: int) -> None:
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO challenge_solves (challenge_id, user_id)
+                VALUES (%s, %s)
+                ON CONFLICT DO NOTHING;
+            """, (challenge_id, user_id))
+        conn.commit()
 
 
-# ---------- Шифры ----------
+# =========================
+# CIPHERS
+# =========================
 def caesar_encode(text: str, shift: int) -> str:
     def shift_char(c: str) -> str:
         if c.isalpha():
@@ -266,6 +281,7 @@ def hex_encode(text: str) -> str:
     return binascii.hexlify(text.encode("utf-8")).decode("ascii")
 
 def url_encode(text: str) -> str:
+    # Важно: percent-encoding. Такой вывод ты хотел (как %2F%3A...)
     return "".join(f"%{b:02X}" for b in text.encode("utf-8"))
 
 def xor_encode(text: str, key: bytes) -> str:
@@ -276,12 +292,7 @@ def xor_encode(text: str, key: bytes) -> str:
 def reverse(text: str) -> str:
     return text[::-1]
 
-
 def encode_text(method: str, text: str) -> Tuple[str, str]:
-    """
-    Возвращает (encoded, hint).
-    Hint мы показываем, потому что ты хочешь формат обучения.
-    """
     method = method.lower()
 
     if method == "caesar":
@@ -302,138 +313,255 @@ def encode_text(method: str, text: str) -> Tuple[str, str]:
         return reverse(text), "Подсказка: строка просто перевёрнута"
     raise ValueError("Unknown method")
 
-
-# ---------- Telegram команды ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привет! Я бот для ежедневных Mini-CTF.🧠 *Справка по командам бота*\n\n"
-        "📌 *Основное*\n"
-        "• /start — краткое приветствие\n"
-        "• /methods — методы шифрования, которые использует бот\n"
-        "• /chatid — показать chat_id текущего чата (для настройки)\n\n"
-        "🧩 *Mini-CTF*\n"
-        "• /add <ссылка или текст> — добавить задание в очередь\n"
-        "• /queue — показать сколько заданий в очереди\n"
-        "• /postnow — запостить Mini-CTF прямо сейчас (только админ)\n\n"
-        "🏆 *Прогресс*\n"
-        "• /profile — твой профиль (ранг + решённые задания)\n"
-        "  ↳ также можно ответить (reply) на сообщение человека и написать /profile — покажет его профиль\n"
-        "• /leaderboard — топ-10 по количеству решённых Mini-CTF\n\n"
-        "✅ *Как засчитывается решение*\n"
-        "✉️ Ответ отправляй боту в личные сообщения:\n"
-        "@nick_encoder_bot\n"
-    )
-
-async def methods(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Методы: " + ", ".join(METHODS))
-
-async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"chat_id: {update.effective_chat.id}")
-
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args).strip()
-    if not text:
-        await update.message.reply_text("Использование: /add <ссылка или текст>")
-        return
-
-    queue = load_queue()
-    queue.append(text)
-    save_queue(queue)
-
-    await update.message.reply_text(
-        f"✅ Добавлено в очередь! Сейчас в очереди: {len(queue)}"
-    )
-
-async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    queue = load_queue()
-    await update.message.reply_text(f"📦 В очереди: {len(queue)}")
-
-def build_challenge_message(payload: str) -> str:
-    method = random.choice(METHODS)
-    encoded, hint = encode_text(method, payload)
-
-    msg = (
+def build_challenge_message(encoded: str, hint: str) -> str:
+    return (
         "🧩 *Mini-CTF дня*\n\n"
         "Расшифруй и получи исходную ссылку/текст 👇\n\n"
         f"`{encoded}`\n\n"
         f"📌 {hint}\n\n"
-        "✉️ Ответ отправляй боту в личные сообщения:\n"
-        "@nick_encoder_bot\n"
+        "✉️ *Ответ отправляй боту в личку* (чтобы никто не спойлерил):\n"
+        "@nick_encoder_bot"
     )
-    return msg
 
-async def post_challenge(app: Application, chat_id: int):
-    queue = load_queue()
-    if not queue:
+def normalize(s: str) -> str:
+    return s.strip()
+
+
+# =========================
+# COMMANDS
+# =========================
+HELP_TEXT = (
+    "🧠 *Справка по командам бота*\n\n"
+    "📌 *Основное*\n"
+    "• /help — показать эту справку\n"
+    "• /methods — методы шифрования\n"
+    "• /chatid — показать chat_id (для настройки)\n\n"
+    "🧩 *Mini-CTF*\n"
+    "• /add <текст/ссылка> — добавить задание в очередь\n"
+    "• /queue — сколько заданий в очереди\n"
+    "• /postnow — запостить Mini-CTF прямо сейчас (только админ)\n\n"
+    "🏆 *Прогресс*\n"
+    "• /profile — твой профиль (ранг + решения)\n"
+    "  ↳ можно ответить (reply) на сообщение человека и написать /profile — покажет его профиль\n"
+    "• /leaderboard — топ-10 по решениям\n\n"
+    "✅ *Как засчитывается решение*\n"
+    "Ответ пишем *только в личные сообщения боту*.\n"
+    "В группе ответы можно писать, но бот удалит их (если у него есть право удалять)."
+)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Я бот для ежедневных Mini-CTF.\n"
+        "Напиши /help чтобы увидеть все команды и правила."
+    )
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+
+async def methods_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Методы: " + ", ".join(METHODS))
+
+async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"chat_id: {update.effective_chat.id}")
+
+async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text("Использование: /add <ссылка или текст>")
+        return
+    c = queue_push(text)
+    await update.message.reply_text(f"✅ Добавлено в очередь! Сейчас в очереди: {c}")
+
+async def queue_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    c = queue_count()
+    await update.message.reply_text(f"📦 В очереди: {c}")
+
+async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # если reply — показываем профиль того пользователя
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user
+    else:
+        target = update.effective_user
+
+    user_id = int(target.id)
+    username = target.username or target.first_name or "Unknown"
+    upsert_user(user_id, target.username or "", target.first_name or "")
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT solves, rank FROM users WHERE user_id=%s;", (user_id,))
+            row = cur.fetchone()
+
+    solves = int(row["solves"]) if row else 0
+    rank = row["rank"] if row else get_rank(0)
+
+    await update.message.reply_text(
+        f"👤 *{username}*\n"
+        f"Ранг: {rank}\n"
+        f"Решено: *{solves}*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT user_id, COALESCE(username, first_name) AS name, solves, rank
+                FROM users
+                WHERE solves > 0
+                ORDER BY solves DESC
+                LIMIT 10;
+            """)
+            rows = cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("📭 Пока никто не решил ни одного Mini-CTF.")
+        return
+
+    text = "🏆 *Leaderboard*\n\n"
+    for i, r in enumerate(rows, start=1):
+        name = r["name"] or str(r["user_id"])
+        rank = r["rank"] or get_rank(int(r["solves"]))
+        text += f"{i}. {rank} *{name}* — {r['solves']} ✅\n"
+
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+async def post_challenge(app: Application, chat_id: int) -> None:
+    if chat_id == 0 or MINI_CTF_THREAD_ID == 0:
+        raise RuntimeError("Set TARGET_CHAT_ID and MINI_CTF_THREAD_ID env vars")
+
+    payload = queue_pop_fifo()
+    if not payload:
         await app.bot.send_message(
             chat_id=chat_id,
             message_thread_id=MINI_CTF_THREAD_ID,
-            text="📭 Сегодня очередь пустая. Добавь ссылки командой: /add <ссылка>",
+            text="📭 Сегодня очередь пустая. Добавь задания командой: /add <ссылка/текст>",
         )
         return
 
-    # Берём 1 элемент из очереди (FIFO)
-    payload = queue.pop(0)
-    save_queue(queue)
-
-    msg = build_challenge_message(payload)
+    method = random.choice(METHODS)
+    encoded, hint = encode_text(method, payload)
+    msg = build_challenge_message(encoded, hint)
 
     sent = await app.bot.send_message(
         chat_id=chat_id,
         message_thread_id=MINI_CTF_THREAD_ID,
         text=msg,
-        parse_mode="Markdown"
+        parse_mode=ParseMode.MARKDOWN
     )
 
-    # 🔐 СОХРАНЯЕМ АКТИВНОЕ ЗАДАНИЕ
-    save_current({
-        "chat_id": chat_id,
-        "thread_id": MINI_CTF_THREAD_ID,
-        "message_id": sent.message_id,  # ← ключевая строка
-        "answer": payload,              # правильный ответ
-        "solved_by": []
-    })
+    # Деактивируем старое активное задание, создаём новое
+    deactivate_old_challenges(chat_id, MINI_CTF_THREAD_ID)
+    create_challenge(
+        chat_id=chat_id,
+        thread_id=MINI_CTF_THREAD_ID,
+        message_id=sent.message_id,
+        method=method,
+        payload=payload,
+        encoded=encoded,
+        answer=payload,
+        hint=hint
+    )
 
-
-
-async def postnow(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Простая защита: разрешаем только админам
+async def postnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # только админы
     member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
     if member.status not in ("administrator", "creator"):
         await update.message.reply_text("⛔ Только админы могут делать /postnow")
         return
 
-    chat_id = update.effective_chat.id
-    await post_challenge(context.application, chat_id)
+    await post_challenge(context.application, update.effective_chat.id)
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id_env = os.getenv("TARGET_CHAT_ID")
-    if not chat_id_env:
+    if TARGET_CHAT_ID == 0:
         return
-    await post_challenge(context.application, int(chat_id_env))
+    await post_challenge(context.application, TARGET_CHAT_ID)
 
 
+# =========================
+# ANSWER CHECKER
+# =========================
+async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
+        return
+
+    # 1) Если человек пишет ответ В ГРУППЕ в Mini-CTF ветке — удаляем (если можем) и просим писать в ЛС
+    if update.effective_chat.type != "private":
+        # удаляем только если это в нужной ветке
+        if msg.message_thread_id == MINI_CTF_THREAD_ID:
+            try:
+                await msg.delete()
+            except Exception:
+                pass  # нет прав удалять
+            # (по желанию) можно отправить подсказку в личку, если бот уже видел пользователя
+        return
+
+    # 2) В ЛС — проверяем ответ
+    current = get_active_challenge()
+    if not current:
+        await msg.reply_text("❌ Сейчас нет активного Mini-CTF.")
+        return
+
+    user = update.effective_user
+    upsert_user(user.id, user.username or "", user.first_name or "")
+
+    challenge_id = int(current["id"])
+    if has_solved(challenge_id, user.id):
+        await msg.reply_text("ℹ️ Ты уже решил это задание.")
+        return
+
+    user_answer = normalize(msg.text)
+    correct = normalize(current["answer"] or "")
+
+    if user_answer != correct:
+        await msg.reply_text("❌ Неверно. Попробуй ещё раз 👀")
+        return
+
+    # ✅ Засчитываем
+    mark_solved(challenge_id, user.id)
+
+    new_solves, old_rank, new_rank = add_solve(user.id)
+
+    await msg.reply_text(
+        "🎉 Верно!\n\n"
+        f"🏆 Всего решений: {new_solves}\n"
+        f"Ранг: {new_rank}"
+    )
+
+    if new_rank != old_rank:
+        await msg.reply_text(f"🎉 Новый ранг: {new_rank}")
+
+
+# =========================
+# MAIN
+# =========================
 def main():
-    token = os.getenv("BOT_TOKEN")
-    if not token:
+    if not BOT_TOKEN:
         raise RuntimeError("Set BOT_TOKEN env var")
+    if not DATABASE_URL:
+        raise RuntimeError("Set DATABASE_URL env var")
 
-    app = Application.builder().token(token).build()
+    init_db()
 
-    # handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer))
-    app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(CommandHandler("leaderboard", leaderboard))
-    app.add_handler(CommandHandler("solve", solve))
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("methods", methods))
-    app.add_handler(CommandHandler("chatid", chatid))
-    app.add_handler(CommandHandler("add", add))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("methods", methods_cmd))
+    app.add_handler(CommandHandler("chatid", chatid_cmd))
+    app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("queue", queue_cmd))
-    app.add_handler(CommandHandler("postnow", postnow))
+    app.add_handler(CommandHandler("postnow", postnow_cmd))
+    app.add_handler(CommandHandler("profile", profile_cmd))
+    app.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
 
-    # ежедневная задача (по времени)
-    # Важно: PTB использует таймзону из переменной TZ ОС. Поставь TZ=America/Los_Angeles при запуске.
+    # Any text (answers) -> checker
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer))
+
+    # Daily post
+    # Важно: для PTB job_queue нужен пакет python-telegram-bot[job-queue]
     app.job_queue.run_daily(daily_job, time=DAILY_POST_TIME)
 
     app.run_polling()

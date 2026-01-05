@@ -333,7 +333,7 @@ def encode_text(method: str, text: str) -> Tuple[str, str]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот для ежедневных Mini-CTF.\n"
-        "Напиши /help чтобы увидеть все команды и правила."
+        "Напиши /helps чтобы увидеть все команды и правила."
     )
 
 async def methods(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -432,7 +432,7 @@ def main():
     app = Application.builder().token(token).build()
 
     # handlers
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("helps", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer))
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("leaderboard", leaderboard))

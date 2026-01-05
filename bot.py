@@ -182,41 +182,38 @@ def normalize(s: str) -> str:
     return s.strip()
 
 async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ✅ Принимаем ТОЛЬКО личные сообщения
+    if update.effective_chat.type != "private":
+        return
+
     msg = update.message
     if not msg or not msg.text:
         return
 
-    # Проверяем что это именно нужная ветка Mini-CTF
-    if msg.message_thread_id != MINI_CTF_THREAD_ID:
-        return
-
     current = load_current()
     if not current:
-        return
-
-    # (опционально) требуем ответом (reply) на пост бота
-    # если хочешь без reply — просто закомментируй этот блок
-    if not msg.reply_to_message or msg.reply_to_message.message_id != current.get("message_id"):
+        await msg.reply_text("❌ Сейчас нет активного Mini-CTF.")
         return
 
     user = update.effective_user
     user_id = str(user.id)
     username = user.username or user.first_name
 
-    # не засчитываем повторно одному и тому же
+    # Не засчитываем повторно
     solved_by = current.get("solved_by", [])
     if user_id in solved_by:
+        await msg.reply_text("ℹ️ Ты уже решил это задание.")
         return
 
     user_answer = normalize(msg.text)
     correct = normalize(current.get("answer", ""))
 
     if user_answer != correct:
+        await msg.reply_text("❌ Неверно. Попробуй ещё раз 👀")
         return
 
-    # ✅ Засчитываем решение (без админ-команды)
+    # ✅ Засчитываем решение
     scores = load_scores()
-
     if user_id not in scores:
         scores[user_id] = {"name": username, "solves": 0, "role": "Solver"}
 
@@ -229,10 +226,9 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_current(current)
 
     await msg.reply_text(
-        f"✅ *Верно!* 🧩\n"
-        f"*{username}* решил Mini-CTF!\n"
-        f"Всего решений: *{scores[user_id]['solves']}*",
-        parse_mode="Markdown"
+        f"🎉 Верно!\n\n"
+        f"🧠 Ты решил Mini-CTF\n"
+        f"🏆 Всего решений: {scores[user_id]['solves']}"
     )
 
 # ---------- Хранилище очереди ----------

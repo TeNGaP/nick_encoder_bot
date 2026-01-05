@@ -308,7 +308,7 @@ def encode_text(method: str, text: str) -> Tuple[str, str]:
 
 
 # ---------- Telegram команды ----------
-async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот для ежедневных Mini-CTF.🧠 *Справка по командам бота*\n\n"
         "📌 *Основное*\n"

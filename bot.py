@@ -308,7 +308,7 @@ def encode_text(method: str, text: str) -> Tuple[str, str]:
 
 
 # ---------- Telegram команды ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот для ежедневных Mini-CTF.🧠 *Справка по командам бота*\n\n"
         "📌 *Основное*\n"
@@ -428,7 +428,7 @@ def main():
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("solve", solve))
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("info", start))
     app.add_handler(CommandHandler("methods", methods))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("add", add))

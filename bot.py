@@ -428,7 +428,7 @@ def main():
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("solve", solve))
-    app.add_handler(CommandHandler("info", start))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("methods", methods))
     app.add_handler(CommandHandler("chatid", chatid))
     app.add_handler(CommandHandler("add", add))
